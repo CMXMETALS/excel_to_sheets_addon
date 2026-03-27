@@ -12,7 +12,7 @@
   - basic "has data" predicates
 */
 
-const BACKEND = "https://excel-sheets-backend.onrender.com";
+const BACKEND = "https://cmx-api.sheetscmx.workers.dev";
 
 // ----------------- CONSTANTS / CONFIG -----------------
 
@@ -164,56 +164,86 @@ function openAuthDialog() {
   );
 }
 
-async function verifyAuth() {
-  setStatus("Verifying sign-in...");
+async function checkAuth() {
   try {
     const res = await fetch(`${BACKEND}/api/sheets`, { credentials: "include" });
     if (res.status === 200) {
       lastAuthOk = true;
       const json = await res.json();
-      sheetsList = json.files || json || [];
+      sheetsList = json || [];
       show($("mainContent"));
+      hide($("auth-section"));
       populateSheetsSelect();
-      $("authStatus").textContent = "Signed in.";
-      setStatus("Signed in. Select a Google Sheets file to work inside.");
-
+      $("authStatus").textContent = "Connected.";
+      setStatus("Select a Google Sheets file to continue.");
       await detectActiveWorksheet();
       refreshSendButtonsState();
-    } else if (res.status === 401) {
-      lastAuthOk = false;
-      hide($("mainContent"));
-      setStatus("Not signed in. Please complete sign-in.");
-      $("authStatus").textContent = "Not signed in.";
     } else {
+      // 401 — not authenticated yet, show connect button
       lastAuthOk = false;
       hide($("mainContent"));
-      setStatus("Auth verify returned: " + res.status);
-      $("authStatus").textContent = "Auth error.";
+      show($("auth-section"));
+      $("authStatus").textContent = "";
+      setStatus("Click Connect to sign in with your company email.");
     }
   } catch (err) {
-    console.error(err);
     lastAuthOk = false;
     hide($("mainContent"));
-    setStatus("Auth check failed: " + (err.message || err));
-    $("authStatus").textContent = "Auth failed.";
+    show($("auth-section"));
+    setStatus("Connection failed: " + (err.message || err));
   }
 }
 
+function openCFAccessDialog() {
+  setStatus("Opening sign-in window...");
+  $("authStatus").textContent = "Waiting for sign-in...";
+
+  Office.context.ui.displayDialogAsync(
+    `${BACKEND}/auth-check`,
+    { height: 60, width: 35, displayInIframe: false },
+    (res) => {
+      if (res.status === Office.AsyncResultStatus.Failed) {
+        setStatus("Failed to open sign-in window.");
+        return;
+      }
+      const dlg = res.value;
+
+      // Listen for message from the page (fires if messageParent works)
+      dlg.addEventHandler(Office.EventType.DialogMessageReceived, async (arg) => {
+        try { dlg.close(); } catch (e) {}
+        setStatus("Verifying connection...");
+        await checkAuth();
+      });
+
+      // Also listen for dialog close event — this fires when the user
+      // closes the window manually OR after CF Access completes and
+      // redirects back. Either way, attempt auth at this point.
+      dlg.addEventHandler(Office.EventType.DialogEventReceived, async (arg) => {
+        // arg.error === 12006 means the dialog was closed
+        setStatus("Verifying connection...");
+        await checkAuth();
+      });
+    }
+  );
+}
+
 async function loadSheets() {
-  if (!lastAuthOk) {
-    setStatus("Please verify sign-in first.");
-    return;
-  }
   setStatus("Reloading Sheets list...");
   try {
     const res = await fetch(`${BACKEND}/api/sheets`, { credentials: "include" });
+    if (res.status === 401) {
+      lastAuthOk = false;
+      hide($("mainContent"));
+      show($("auth-section"));
+      setStatus("Session expired. Please reconnect.");
+      return;
+    }
     if (!res.ok) throw new Error("Failed to load sheets: " + res.status);
     const json = await res.json();
-    sheetsList = json.files || json || [];
+    sheetsList = json || [];
     populateSheetsSelect();
     setStatus("Sheets list reloaded.");
   } catch (err) {
-    console.error(err);
     setStatus("Reload failed: " + (err.message || err));
   }
 }

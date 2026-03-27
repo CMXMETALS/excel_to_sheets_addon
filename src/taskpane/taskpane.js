@@ -34,8 +34,8 @@ async function registerExcelTabEvents_() {
 
 Office.onReady(() => {
   // auth
-  $("googleSignInBtn").addEventListener("click", openAuthDialog);
-  $("verifyAuthBtn").addEventListener("click", verifyAuth);
+  $("cfSignInBtn").addEventListener("click", openCFAccessDialog);
+
 
   // sheet reload/select
   $("reloadSheetsBtn").addEventListener("click", loadSheets);
@@ -74,7 +74,10 @@ Office.onReady(() => {
   }
 
   hide($("mainContent"));
-  setStatus("Please sign in to continue.");
+  setStatus("Connecting...");
+  registerExcelTabEvents_()
+    .then(() => checkAuth())
+    .catch(err => console.warn("startup error", err));
 
   // initial detect + register tab-change handler (no constant polling)
   registerExcelTabEvents_()
