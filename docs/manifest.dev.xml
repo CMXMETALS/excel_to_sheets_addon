@@ -9,13 +9,12 @@
   <IconUrl DefaultValue="https://outsider1113.github.io/excel_to_sheets_addon/assets/icon-32.png"/>
   <HighResolutionIconUrl DefaultValue="https://outsider1113.github.io/excel_to_sheets_addon/assets/icon-64.png"/>
   <SupportUrl DefaultValue="https://www.contoso.com/help"/>
-  <AppDomains>
-    <AppDomain>https://www.contoso.com</AppDomain>
-    <AppDomain>https://excel-sheets-backend.onrender.com</AppDomain>
-    <AppDomain>https://accounts.google.com</AppDomain>
-    <AppDomain>https://www.googleapis.com</AppDomain>
-    <AppDomain>https://apis.google.com</AppDomain>
-  </AppDomains>
+<AppDomains>
+  <AppDomain>https://localhost:3000</AppDomain>
+  <AppDomain>https://cmx-api.sheetscmx.workers.dev</AppDomain>
+  <AppDomain>https://cmxmetals.cloudflareaccess.com</AppDomain>
+  <AppDomain>https://appsforoffice.microsoft.com</AppDomain>
+</AppDomains>
   <Hosts>
     <Host Name="Workbook"/>
   </Hosts>
