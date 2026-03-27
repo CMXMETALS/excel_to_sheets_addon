@@ -7,26 +7,22 @@
   xsi:type="TaskPaneApp">
 
   <Id>e3972aa3-a326-4950-aff7-bac2a64844af</Id>
-  <Version>1.0.0.9</Version>
+  <Version>1.0.1.0</Version>
 
   <ProviderName>CMX Metals</ProviderName>
   <DefaultLocale>en-US</DefaultLocale>
   <DisplayName DefaultValue="CMX Excel to Sheets Sync"/>
   <Description DefaultValue="Sync Excel receiver data into CMX Google Sheets (CURRENT PIPELINE and MASTER RECEIVERS)." />
 
-  <IconUrl DefaultValue="https://outsider1113.github.io/excel_to_sheets_addon/assets/icon-32.png" />
-  <HighResolutionIconUrl DefaultValue="https://outsider1113.github.io/excel_to_sheets_addon/assets/icon-128.png" />
+  <IconUrl DefaultValue="https://cmxmetals.github.io/excel_to_sheets_addon/assets/icon-32.png" />
+  <HighResolutionIconUrl DefaultValue="https://cmxmetals.github.io/excel_to_sheets_addon/assets/icon-128.png" />
 
-  <SupportUrl DefaultValue="https://github.com/outsider1113/excel_to_sheets_addon" />
+  <SupportUrl DefaultValue="https://github.com/CMXMETALS/excel_to_sheets_addon" />
 
   <AppDomains>
-    <AppDomain>https://outsider1113.github.io</AppDomain>
-    <AppDomain>https://excel-sheets-backend.onrender.com</AppDomain>
-    <AppDomain>https://accounts.google.com</AppDomain>
-    <AppDomain>https://www.googleapis.com</AppDomain>
-    <AppDomain>https://apis.google.com</AppDomain>
-
-    <!-- Extra safety: Office.js CDN -->
+    <AppDomain>https://cmxmetals.github.io</AppDomain>
+    <AppDomain>https://cmx-api.sheetscmx.workers.dev</AppDomain>
+    <AppDomain>https://cmxmetals.cloudflareaccess.com</AppDomain>
     <AppDomain>https://appsforoffice.microsoft.com</AppDomain>
   </AppDomains>
 
@@ -35,7 +31,7 @@
   </Hosts>
 
   <DefaultSettings>
-    <SourceLocation DefaultValue="https://outsider1113.github.io/excel_to_sheets_addon/taskpane.html" />
+    <SourceLocation DefaultValue="https://cmxmetals.github.io/excel_to_sheets_addon/taskpane.html" />
   </DefaultSettings>
 
   <Permissions>ReadWriteDocument</Permissions>
@@ -94,14 +90,14 @@
 
     <ov:Resources>
       <bt:Images>
-        <bt:Image id="CMX.Icon.16" DefaultValue="https://outsider1113.github.io/excel_to_sheets_addon/assets/icon-16.png" />
-        <bt:Image id="CMX.Icon.32" DefaultValue="https://outsider1113.github.io/excel_to_sheets_addon/assets/icon-32.png" />
-        <bt:Image id="CMX.Icon.80" DefaultValue="https://outsider1113.github.io/excel_to_sheets_addon/assets/icon-80.png" />
+        <bt:Image id="CMX.Icon.16" DefaultValue="https://cmxmetals.github.io/excel_to_sheets_addon/assets/icon-16.png" />
+        <bt:Image id="CMX.Icon.32" DefaultValue="https://cmxmetals.github.io/excel_to_sheets_addon/assets/icon-32.png" />
+        <bt:Image id="CMX.Icon.80" DefaultValue="https://cmxmetals.github.io/excel_to_sheets_addon/assets/icon-80.png" />
       </bt:Images>
 
       <bt:Urls>
-        <bt:Url id="CMX.TaskpaneUrl" DefaultValue="https://outsider1113.github.io/excel_to_sheets_addon/taskpane.html" />
-        <bt:Url id="CMX.CommandsUrl" DefaultValue="https://outsider1113.github.io/excel_to_sheets_addon/commands.html" />
+        <bt:Url id="CMX.TaskpaneUrl" DefaultValue="https://cmxmetals.github.io/excel_to_sheets_addon/taskpane.html" />
+        <bt:Url id="CMX.CommandsUrl" DefaultValue="https://cmxmetals.github.io/excel_to_sheets_addon/commands.html" />
       </bt:Urls>
 
       <bt:ShortStrings>

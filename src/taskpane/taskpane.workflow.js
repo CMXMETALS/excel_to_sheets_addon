@@ -90,6 +90,9 @@ async function readFieldsFromExcel_Create() {
     setStatus("Failed to read Excel fields: " + (err.message || err));
   } finally {
     createInFlight = false;
+    invalidateReceiverRecordStatusCache_();
+    await evaluateWorkspaceState();
+    updateModeBanner();
     updateResyncWarning();
     refreshSendButtonsState();
   }
