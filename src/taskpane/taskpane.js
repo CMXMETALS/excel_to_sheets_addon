@@ -2,8 +2,9 @@
 /*
   Main entrypoint:
   - wires up DOM events in Office.onReady
-  - starts active worksheet polling with blocking overlay on tab changes
-  - routes send button to review modal handled in workflow.js
+  - registers Excel events (tab switch, cell edit, tab rename) — all handled
+    locally, none of them call Google Sheets
+  - starts the Cloudflare Access sign-in check
 */
 
 let excelEventsRegistered = false;
@@ -16,19 +17,65 @@ function debounce_(fn, waitMs) {
   };
 }
 
-async function registerExcelTabEvents_() {
-  if (excelEventsRegistered) return;
+// Compare Excel with the last read, shortly after things settle.
+const scheduleExcelCheck_ = debounce_(() => {
+  checkExcelForChanges_().catch(err => console.warn("excel check error", err));
+}, 400);
+
+function excelApiSupported_(version) {
+  try {
+    return Office.context.requirement.isSetSupported("ExcelApi", version);
+  } catch (e) {
+    return false;
+  }
+}
+
+// Each event is registered on its own so an unsupported one cannot block the others.
+async function registerOneExcelEvent_(label, attach) {
   try {
     await Excel.run(async (ctx) => {
-      // Fires when user changes the active worksheet (tab switch)
-      ctx.workbook.worksheets.onActivated.add(() => {
-        detectActiveWorksheet(true).catch(err => console.warn("tab activated detect error", err));
-      });
+      attach(ctx.workbook.worksheets);
       await ctx.sync();
     });
-    excelEventsRegistered = true;
+    return true;
   } catch (err) {
-    console.warn("Worksheet activation event not available; rely on manual refresh + key events", err);
+    console.warn(`Excel event "${label}" not available; Resync and the pre-send check cover it.`, err);
+    return false;
+  }
+}
+
+async function registerExcelTabEvents_() {
+  if (excelEventsRegistered) return;
+  excelEventsRegistered = true;
+
+  // Tab switch
+  await registerOneExcelEvent_("onActivated", (sheets) => {
+    sheets.onActivated.add(() => {
+      scheduleExcelCheck_();
+      return Promise.resolve();
+    });
+  });
+
+  // Cell edits on any worksheet (only matters for the tab that was read)
+  if (excelApiSupported_("1.9")) {
+    await registerOneExcelEvent_("onChanged", (sheets) => {
+      sheets.onChanged.add((args) => {
+        if (lastRead && (!args || !args.worksheetId || args.worksheetId === lastRead.sheetId)) {
+          scheduleExcelCheck_();
+        }
+        return Promise.resolve();
+      });
+    });
+  }
+
+  // Tab rename (newer Excel only)
+  if (excelApiSupported_("1.17")) {
+    await registerOneExcelEvent_("onNameChanged", (sheets) => {
+      sheets.onNameChanged.add(() => {
+        scheduleExcelCheck_();
+        return Promise.resolve();
+      });
+    });
   }
 }
 
@@ -36,51 +83,44 @@ Office.onReady(() => {
   // auth
   $("cfSignInBtn").addEventListener("click", openCFAccessDialog);
 
-
   // sheet reload/select
   $("reloadSheetsBtn").addEventListener("click", loadSheets);
   $("modify_sheet_select").addEventListener("change", onSheetSelected);
 
-  // create panel
+  // read + send
   $("create_prefill").addEventListener("click", readFieldsFromExcel_Create);
   $("create_send").addEventListener("click", openSendReviewModal);
-  $("create_add_line").addEventListener("click", () => addLineItem());
-  $("create_workspace_name").addEventListener("input", refreshSendButtonsState);
-
-  // Key fields affect Create vs Modify; re-evaluate on change (no constant polling)
-  const onKeyChange = debounce_(async () => {
-    invalidateReceiverRecordStatusCache_();
-    await evaluateWorkspaceState();
-    updateModeBanner();
-    updateResyncWarning();
-    refreshSendButtonsState();
-  }, 250);
-  ["c_rcv", "c_po", "c_dr"].forEach(id => {
-    const el = $(id);
-    if (el) el.addEventListener("input", onKeyChange);
-  });
 
   // modal actions
   $("actionModalCancel").addEventListener("click", closeActionModal);
   $("actionModalConfirm").addEventListener("click", confirmPendingSend);
 
-  // Optional manual refresh button – still works as a quick resync
-  const refreshBtn = $("refreshActiveSheet");
-  if (refreshBtn) {
-    refreshBtn.addEventListener("click", async () => {
-      await detectActiveWorksheet(true);
-      refreshSendButtonsState();
-    });
-  }
+  // Resync: re-check the active tab's name and whether its values changed (Excel only)
+  $("refreshActiveSheet").addEventListener("click", async () => {
+    await checkExcelForChanges_();
+    if (!getSendBlocker_() || !lastRead) setStatus("");
+  });
+
+  // receiver details show/hide
+  $("detailsToggle").addEventListener("click", () => {
+    const btn = $("detailsToggle");
+    const open = btn.getAttribute("aria-expanded") === "true";
+    btn.setAttribute("aria-expanded", open ? "false" : "true");
+    const label = open ? "Show receiver details" : "Hide receiver details";
+    btn.setAttribute("aria-label", label);
+    btn.setAttribute("title", label);
+    refreshUI();
+  });
+
+  // Coming back to the pane after working in the grid: re-check locally.
+  window.addEventListener("focus", scheduleExcelCheck_);
 
   hide($("mainContent"));
-  setStatus("Connecting...");
-  registerExcelTabEvents_()
-    .then(() => checkAuth())
-    .catch(err => console.warn("startup error", err));
+  setStatus("");
+  setAuthView("checking");
 
-  // initial detect + register tab-change handler (no constant polling)
   registerExcelTabEvents_()
-    .then(() => detectActiveWorksheet(true))
-    .catch(err => console.warn("initial detect error", err));
+    .catch(err => console.warn("event registration error", err))
+    .then(() => checkAuth({ attempts: 1 }))
+    .catch(err => console.warn("startup error", err));
 });

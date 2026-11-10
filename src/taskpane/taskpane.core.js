@@ -4,59 +4,58 @@
   - constants & config
   - DOM helpers
   - shared state
-  - auth / Sheets helpers
-  - active worksheet tracking
-  - workspace state helpers
-  - line-items helpers
-  - build/write helpers
-  - basic "has data" predicates
+  - Cloudflare Access sign-in (checks + waits)
+  - Sheets file list
+  - active worksheet tracking + local "Excel changed" detection (no network)
+  - commodity parsing + totals
+
+  NETWORK RULES (keeps Google Sheets API usage low):
+  - /api/sheets              : sign-in check and "Reload Sheets list" only
+  - /api/receiverRecordStatus: ONLY when "Read data" is pressed (see workflow.js)
+  - /api/updateMasterFromReceiver + /api/upsertReceiverRecord: ONLY on Send
+  Tab switches, renames and cell edits are handled entirely inside Excel.
 */
 
 const BACKEND = "https://cmx-api.sheetscmx.workers.dev";
 
 // ----------------- CONSTANTS / CONFIG -----------------
 
-// Header fields shared by Create / Modify.
+// Header fields on the receiver template.
 const HEADER_FIELDS = [
-  { key: "pf",  cell: "B11", cId: "c_pf",  mId: "m_pf"  },
-  { key: "dr",  cell: "B12", cId: "c_dr",  mId: "m_dr"  },
-  { key: "carrier", cell: "B13", cId: "c_carrier", mId: "m_carrier" },
-  { key: "po",  cell: "E11", cId: "c_po",  mId: "m_po"  },
-  { key: "rcv", cell: "E12", cId: "c_rcv", mId: "m_rcv" },
-  { key: "ver", cell: "E13", cId: "c_ver", mId: "m_ver" }
+  { key: "pf",      cell: "B11", cId: "c_pf" },
+  { key: "dr",      cell: "B12", cId: "c_dr" },
+  { key: "carrier", cell: "B13", cId: "c_carrier" },
+  { key: "po",      cell: "E11", cId: "c_po" },
+  { key: "rcv",     cell: "E12", cId: "c_rcv" },
+  { key: "ver",     cell: "E13", cId: "c_ver" }
 ];
 
-// Line item layout (multiple rows).
+// Line item layout (multiple rows): A=ITEM NO, B=COMMODITY, C=GROSS, D=TARE, F=COST
 const ITEM_START_ROW = 18;   // first row for items
 const MAX_LINE_ITEMS = 20;   // safety cap
-const ITEM_COLUMNS = {
-  item:  "A",    // ITEM NO
-  com:   "B",    // COMMODITY
-  gross: "C",    // GROSS
-  tare:  "D",    // TARE
-  cost:  "F",    // COST
-  notes: "O"     // MATERIAL NOTES
-};
-const LINE_KEYS = ["item", "com", "gross", "tare", "cost"];
 
 // Regex to extract id from Excel tab name, e.g. "...-11-02-345"
 const ID_RE = /-\s*(\d{1,2})-(\d{1,2})-(\d{3})$/;
+
+const LAST_SHEET_STORAGE_KEY = "cmx.lastSheetId";
 
 // ----------------- DOM HELPERS -----------------
 
 const $ = id => document.getElementById(id);
 const show = el => el && el.classList.remove("hidden");
 const hide = el => el && el.classList.add("hidden");
+const sleep_ = ms => new Promise(r => setTimeout(r, ms));
 
-function setStatus(txt) {
+// kind: "info" (default) | "success" | "warn" | "error"
+function setStatus(txt, kind) {
   const box = $("statusBox");
   if (!box) return;
   if (txt && txt.length) {
+    box.className = "notice notice-" + (kind || "info");
     box.textContent = txt;
-    show(box);
   } else {
     box.textContent = "";
-    hide(box);
+    box.className = "notice notice-info hidden";
   }
 }
 
@@ -95,421 +94,469 @@ function setGlobalLoading(isLoading, message) {
 
 // ----------------- RUNTIME STATE -----------------
 
-let pollHandle = null;
-
 let lastAuthOk = false;
 let sheetsList = [];
 let selectedSheetId = null;
-let currentTabs = [];   // tab titles for selected sheet
 
+// Active Excel worksheet (name can change on rename; id never does)
 let currentActiveWorksheet = null;
-let lastDetectedWorksheet = null;
+let currentActiveWorksheetId = null;
 
-// Which sheet did we read fields from last?
-let lastReadCreateSheetName = null;
+// Data from the last "Read data" press
+let headerValues = { pf: "", dr: "", carrier: "", po: "", rcv: "", ver: "" };
+let createLineItems = [];   // [{ row, item, com, gross, tare, cost }]
+let lastRead = null;        // { sheetId, sheetName, fileId, signature }
 
-let workspaceState = {
-  type: "unknown",      // "existing" | "new-valid" | "title-invalid" | "unknown"
-  identifier: null,     // -MM-DD-XXX extracted from Excel
-  matchedTab: null      // tab title in Sheets (if any)
-};
+// True when the Excel cells differ from what was last read (detected locally)
+let excelChangedSinceRead = false;
 
-// Whether this RR# + PO# already exists in RECEIVER RECORDS (determines Create vs Modify)
+// Whether this RR# + PO# already exists in RECEIVER RECORDS.
+// true = update, false = new, null = not checked / unknown.
 let receiverRecordExists = null;
-// Throttle expensive server checks (prevents Sheets API read quota bursts)
-const RECEIVER_STATUS_TTL_MS = 30 * 1000;          // cache /api/receiverRecordStatus result
-const WORKSPACE_EVAL_MIN_INTERVAL_MS = 10 * 1000;  // don't re-evaluate every 2s poll unless inputs/tab changed
-let _rrStatusCache = { key: null, at: 0, exists: null };
-let _rrStatusInFlight = null;
-let _lastWorkspaceEvalKey = null;
-let _lastWorkspaceEvalAt = 0;
-
-function invalidateReceiverRecordStatusCache_() {
-  _rrStatusCache = { key: null, at: 0, exists: null };
-  _rrStatusInFlight = null;
-  _lastWorkspaceEvalAt = 0; // allow immediate re-eval
-}
-
 
 let createInFlight = false;
 let sendInFlight = false;
 
-// dynamic line items (arrays of { item, com, gross, tare, cost })
-let createLineItems = [];
+// ----------------- CLOUDFLARE ACCESS SIGN-IN -----------------
 
-// ----------------- AUTH / SHEETS -----------------
+let authDialog = null;          // open sign-in dialog, if any
+let _authCheckPromise = null;   // de-dupes concurrent checks
+let _verifyRunning = false;
+let _verifyAgain = false;
 
-function openAuthDialog() {
-  setStatus("Opening sign-in window...");
-  Office.context.ui.displayDialogAsync(
-    `${BACKEND}/auth`,
-    { height: 60, width: 35, displayInIframe: true },
-    (res) => {
-      if (res.status === Office.AsyncResultStatus.Failed) {
-        setStatus("Failed to open sign-in window.");
-        return;
-      }
-      const dlg = res.value;
-      dlg.addEventHandler(Office.EventType.DialogMessageReceived, (arg) => {
-        if (arg && arg.message) {
-          if (arg.message === "auth-success" || arg.message === "success") {
-            setStatus("Authentication completed. Click Verify Sign-In.");
-          } else {
-            setStatus("Auth message: " + arg.message);
-          }
-        }
-        try { dlg.close(); } catch (e) {}
-      });
-    }
-  );
+// state: "checking" | "signedOut" | "waiting" | "verifying" | "error"
+function setAuthView(state, msg, kind) {
+  const progress = $("authProgress");
+  const statusEl = $("authStatus");
+  const errEl = $("authError");
+  const btn = $("cfSignInBtn");
+  if (!progress || !statusEl || !errEl || !btn) return;
+
+  hide(progress);
+  hide(errEl);
+  show(btn);
+  setButtonEnabled(btn, true);
+  btn.textContent = "Connect";
+
+  if (state === "checking") {
+    statusEl.textContent = msg || "Checking your connection…";
+    show(progress);
+    hide(btn);
+  } else if (state === "waiting") {
+    statusEl.textContent = msg || "Waiting for you to finish signing in…";
+    show(progress);
+    btn.textContent = "Open sign-in window again";
+  } else if (state === "verifying") {
+    statusEl.textContent = msg || "Verifying sign-in…";
+    show(progress);
+    setButtonEnabled(btn, false);
+  } else if (state === "error") {
+    errEl.className = "notice notice-" + (kind || "error");
+    errEl.textContent = msg || "Sign-in failed.";
+    show(errEl);
+    btn.textContent = "Try again";
+  } else if (msg) {
+    // signedOut with an explanation (e.g. session expired)
+    errEl.className = "notice notice-" + (kind || "warn");
+    errEl.textContent = msg;
+    show(errEl);
+  }
 }
 
-async function checkAuth() {
+function setConnBadge_(ok) {
+  const b = $("connBadge");
+  if (!b) return;
+  b.textContent = ok ? "Connected" : "Not connected";
+  if (ok) b.classList.add("ok");
+  else b.classList.remove("ok");
+}
+
+// One request to the Worker. This is the same call the add-in has always used
+// to test the Cloudflare Access session (cookie is sent via credentials: "include").
+// Returns { ok: true, list } or { ok: false, status } (status 0 = no response / blocked).
+async function fetchSheetsList_(timeoutMs) {
+  const ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs || 20000) : null;
   try {
-    const res = await fetch(`${BACKEND}/api/sheets`, { credentials: "include" });
+    const opts = { credentials: "include" };
+    if (ctrl) opts.signal = ctrl.signal;
+    const res = await fetch(`${BACKEND}/api/sheets`, opts);
     if (res.status === 200) {
-      lastAuthOk = true;
       const json = await res.json();
-      sheetsList = json || [];
-      show($("mainContent"));
-      hide($("auth-section"));
-      populateSheetsSelect();
-      $("authStatus").textContent = "Connected.";
-      setStatus("Select a Google Sheets file to continue.");
-      await detectActiveWorksheet();
-      refreshSendButtonsState();
-    } else {
-      // 401 — not authenticated yet, show connect button
-      lastAuthOk = false;
-      hide($("mainContent"));
-      show($("auth-section"));
-      $("authStatus").textContent = "";
-      setStatus("Click Connect to sign in with your company email.");
+      return { ok: true, list: Array.isArray(json) ? json : [] };
     }
+    return { ok: false, status: res.status };
   } catch (err) {
-    lastAuthOk = false;
-    hide($("mainContent"));
-    show($("auth-section"));
-    setStatus("Connection failed: " + (err.message || err));
+    // Not signed in (Access redirected the request), offline, or timed out.
+    return { ok: false, status: 0, error: err };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// opts: { attempts = 1, delayMs = 1500, afterDialog = false }
+// Resolves true when signed in.
+function checkAuth(opts) {
+  if (_authCheckPromise) return _authCheckPromise;
+  _authCheckPromise = runAuthCheck_(opts || {}).finally(() => { _authCheckPromise = null; });
+  return _authCheckPromise;
+}
+
+async function runAuthCheck_(opts) {
+  const attempts = opts.attempts || 1;
+  const delayMs = opts.delayMs || 1500;
+  const afterDialog = !!opts.afterDialog;
+
+  let result = null;
+  for (let i = 1; i <= attempts; i++) {
+    if (!lastAuthOk) {
+      if (afterDialog) {
+        setAuthView("verifying", i > 1 ? `Verifying sign-in… (try ${i} of ${attempts})` : "Verifying sign-in…");
+      } else {
+        setAuthView("checking");
+      }
+    }
+
+    result = await fetchSheetsList_();
+    if (result.ok) {
+      await onAuthOk_(result.list);
+      return true;
+    }
+
+    // A real server error (e.g. 500 from the Worker) will not fix itself by retrying.
+    if (result.status && result.status !== 401 && result.status !== 403) break;
+
+    if (i < attempts) await sleep_(delayMs);
+  }
+
+  onAuthFail_(result, afterDialog);
+  return false;
+}
+
+async function onAuthOk_(list) {
+  lastAuthOk = true;
+  sheetsList = list || [];
+  setConnBadge_(true);
+  show($("mainContent"));
+  hide($("auth-section"));
+  populateSheetsSelect();
+
+  if (selectedSheetId) setStatus("");
+  else setStatus("Choose a Google Sheets file to continue.");
+
+  await detectActiveWorksheet();
+  refreshUI();
+}
+
+function onAuthFail_(result, afterDialog) {
+  lastAuthOk = false;
+  setConnBadge_(false);
+  hide($("mainContent"));
+  show($("auth-section"));
+  setStatus("");
+
+  const status = result ? result.status : 0;
+
+  // Sign-in window is still open: keep waiting for it.
+  if (authDialog) {
+    setAuthView("waiting");
+    return;
+  }
+
+  if (status && status !== 401 && status !== 403) {
+    setAuthView(
+      "error",
+      `You are signed in, but the CMX server returned an error (${status}). Wait a minute and try again.`
+    );
+  } else if (afterDialog) {
+    setAuthView(
+      "error",
+      "Sign-in was not confirmed. Click Try again and finish the email code step. " +
+      "If it keeps failing, check your internet connection."
+    );
+  } else {
+    setAuthView("signedOut");
+  }
+}
+
+// Called when any API call shows the session is gone (401 or blocked request).
+function handleAuthLost_(msg) {
+  lastAuthOk = false;
+  setConnBadge_(false);
+  hide($("mainContent"));
+  show($("auth-section"));
+  setStatus("");
+  setAuthView("signedOut", msg || "Your sign-in expired. Connect again to continue. Your Excel data is untouched.");
+}
+
+// After the sign-in dialog reports back: check, wait, check again (max 3 tries).
+async function verifyAfterSignIn_() {
+  if (_verifyRunning) {
+    _verifyAgain = true;
+    return;
+  }
+  _verifyRunning = true;
+  try {
+    do {
+      _verifyAgain = false;
+      const ok = await checkAuth({ attempts: 3, delayMs: 1500, afterDialog: true });
+      if (ok) break;
+    } while (_verifyAgain);
+  } finally {
+    _verifyRunning = false;
   }
 }
 
 function openCFAccessDialog() {
-  setStatus("Opening sign-in window...");
-  $("authStatus").textContent = "Waiting for sign-in...";
+  // Already confirming a sign-in: don't open a second window.
+  if (_verifyRunning) return;
+
+  // Only one Office dialog may be open at a time.
+  if (authDialog) {
+    try { authDialog.close(); } catch (e) {}
+    authDialog = null;
+  }
+
+  setAuthView("waiting", "Opening sign-in window…");
 
   Office.context.ui.displayDialogAsync(
     `${BACKEND}/auth-check`,
     { height: 60, width: 35, displayInIframe: false },
     (res) => {
       if (res.status === Office.AsyncResultStatus.Failed) {
-        setStatus("Failed to open sign-in window.");
+        const code = res.error && res.error.code ? ` (code ${res.error.code})` : "";
+        setAuthView(
+          "error",
+          `Could not open the sign-in window${code}. Close any other sign-in window and try again.`
+        );
         return;
       }
-      const dlg = res.value;
 
-      // Listen for message from the page (fires if messageParent works)
-      dlg.addEventHandler(Office.EventType.DialogMessageReceived, async (arg) => {
+      const dlg = res.value;
+      authDialog = dlg;
+      setAuthView("waiting");
+
+      // The /auth-check page reports success once Cloudflare Access lets it load.
+      dlg.addEventHandler(Office.EventType.DialogMessageReceived, () => {
         try { dlg.close(); } catch (e) {}
-        setStatus("Verifying connection...");
-        await checkAuth();
+        if (authDialog === dlg) authDialog = null;
+        verifyAfterSignIn_();
       });
 
-      // Also listen for dialog close event — this fires when the user
-      // closes the window manually OR after CF Access completes and
-      // redirects back. Either way, attempt auth at this point.
-      dlg.addEventHandler(Office.EventType.DialogEventReceived, async (arg) => {
-        // arg.error === 12006 means the dialog was closed
-        setStatus("Verifying connection...");
-        await checkAuth();
+      // Fires when the window is closed (by the user, or by the page itself after
+      // Access completes) or fails to load. Either way, test the session now.
+      dlg.addEventHandler(Office.EventType.DialogEventReceived, (arg) => {
+        if (arg && arg.error === 12006 && authDialog === dlg) authDialog = null;
+        verifyAfterSignIn_();
       });
     }
   );
 }
 
+// ----------------- SHEETS FILE LIST -----------------
+
 async function loadSheets() {
-  setStatus("Reloading Sheets list...");
-  try {
-    const res = await fetch(`${BACKEND}/api/sheets`, { credentials: "include" });
-    if (res.status === 401) {
-      lastAuthOk = false;
-      hide($("mainContent"));
-      show($("auth-section"));
-      setStatus("Session expired. Please reconnect.");
-      return;
-    }
-    if (!res.ok) throw new Error("Failed to load sheets: " + res.status);
-    const json = await res.json();
-    sheetsList = json || [];
+  setStatus("Reloading Sheets list…");
+  const result = await fetchSheetsList_();
+  if (result.ok) {
+    sheetsList = result.list;
     populateSheetsSelect();
-    setStatus("Sheets list reloaded.");
-  } catch (err) {
-    setStatus("Reload failed: " + (err.message || err));
+    setStatus("Sheets list reloaded.", "success");
+    refreshUI();
+    return;
   }
+  if (result.status === 401 || result.status === 403 || result.status === 0) {
+    handleAuthLost_();
+    return;
+  }
+  setStatus("Reload failed: server returned " + result.status + ".", "error");
 }
 
+function readStoredSheetId_() {
+  try { return window.localStorage.getItem(LAST_SHEET_STORAGE_KEY) || null; } catch (e) { return null; }
+}
+
+function storeSheetId_(id) {
+  try {
+    if (id) window.localStorage.setItem(LAST_SHEET_STORAGE_KEY, id);
+  } catch (e) {}
+}
+
+// Rebuilds the dropdown, keeping the current choice (or the one used last time).
 function populateSheetsSelect() {
   const sel = $("modify_sheet_select");
   if (!sel) return;
-  sel.innerHTML = "<option value=''>— choose sheet file —</option>";
+  sel.innerHTML = "";
+
+  const first = document.createElement("option");
+  first.value = "";
+  first.textContent = "— choose sheet file —";
+  sel.appendChild(first);
+
   sheetsList.forEach(f => {
     const o = document.createElement("option");
     o.value = f.id;
     o.textContent = f.name;
     sel.appendChild(o);
   });
+
+  const wanted = selectedSheetId || readStoredSheetId_();
+  const exists = wanted && sheetsList.some(f => f.id === wanted);
+  sel.value = exists ? wanted : "";
+  selectedSheetId = exists ? wanted : null;
 }
 
-async function onSheetSelected() {
+// No network here: choosing a file only records the choice.
+function onSheetSelected() {
   selectedSheetId = $("modify_sheet_select").value || null;
-  currentTabs = [];
-  workspaceState = { type: "unknown", identifier: null, matchedTab: null };
+  storeSheetId_(selectedSheetId);
 
   if (!selectedSheetId) {
-    setStatus("Select a Google Sheets file to continue.");
-    setSectionLocked($("createPanel"), true);
-    refreshSendButtonsState();
-    return;
+    setStatus("Choose a Google Sheets file to continue.");
+  } else if (lastRead && lastRead.fileId !== selectedSheetId) {
+    setStatus("Sheets file changed. Read data again to check it against this file.", "warn");
+  } else if (!lastRead) {
+    setStatus("Ready. Read the receiver from Excel.");
+  } else {
+    setStatus("");
   }
-
-  setStatus("Loading tabs for the selected file...");
-  try {
-    const res = await fetch(
-      `${BACKEND}/api/tabs?sheetId=${encodeURIComponent(selectedSheetId)}`,
-      { credentials: "include" }
-    );
-    if (!res.ok) {
-      setStatus("Failed to load tabs: " + res.status);
-      refreshSendButtonsState();
-      return;
-    }
-    const data = await res.json();
-    currentTabs = (data || []).map(t =>
-      (t.properties && t.properties.title) ? t.properties.title : (t.title || t)
-    );
-
-    await evaluateWorkspaceState();
-    updateModeBanner();
-    updateResyncWarning();
-
-    if (workspaceState.type === "existing" && workspaceState.matchedTab) {
-      setStatus(
-        `Workspace for this Excel tab already exists as "${workspaceState.matchedTab}". ` +
-        "Sending will update that tab."
-      );
-    } else if (workspaceState.type === "title-invalid") {
-      // evaluateWorkspaceState already set a detailed message about title format.
-    } else {
-      setStatus("Tabs loaded. Ready to read from Excel.");
-    }
-
-    // Section is now unlocked (but buttons still controlled by refreshSendButtonsState)
-    setSectionLocked($("createPanel"), false);
-  } catch (err) {
-    console.error(err);
-    setStatus("Error loading tabs: " + (err.message || err));
-  } finally {
-    refreshSendButtonsState();
-  }
+  refreshUI();
 }
 
-// ----------------- ACTIVE WORKSHEET TRACKING -----------------
+// ----------------- ACTIVE WORKSHEET TRACKING (Excel only) -----------------
 
-async function detectActiveWorksheet(forceOverlay = false) {
-  let showLoader = false;
+function applyActiveSheet_(id, name) {
+  currentActiveWorksheetId = id || null;
+  currentActiveWorksheet = name || "";
+}
+
+// Re-reads the active tab's name + id from Excel. No network.
+async function detectActiveWorksheet() {
   try {
     await Excel.run(async (ctx) => {
       const ws = ctx.workbook.worksheets.getActiveWorksheet();
-      ws.load("name");
+      ws.load("name,id");
       await ctx.sync();
-
-      const currentName = ws.name || "";
-      const tabChanged = currentName !== lastDetectedWorksheet;
-      if (forceOverlay || tabChanged) {
-        setGlobalLoading(true, "Updating for active Excel tab...");
-        showLoader = true;
-      }
-
-      currentActiveWorksheet = currentName;
-      lastDetectedWorksheet = currentName;
-
-      const nameSpan = $("activeSheetName");
-      if (nameSpan) nameSpan.textContent = currentName;
-
-      // Always mirror active Excel tab into the workspace-name field
-      updateCreateWorkspaceNameFromActive(currentName);
-
-      // Re-evaluate workspace existence and warnings on each poll
-      // Re-evaluate sparingly (prevents backend/Snapshot reminders from hammering Sheets)
-      const rrVal = ($("c_rcv")?.value || "").trim();
-      const poVal = ($("c_po")?.value || "").trim();
-      const dtVal = ($("c_dr")?.value || "").trim();
-      const evalKey = `${currentName}|${selectedSheetId || ""}|${rrVal}|${poVal}|${dtVal}`;
-      const now = Date.now();
-
-      const keyChanged = evalKey !== _lastWorkspaceEvalKey;
-      const timeOk = (now - _lastWorkspaceEvalAt) >= WORKSPACE_EVAL_MIN_INTERVAL_MS;
-
-      if (forceOverlay || tabChanged || keyChanged || timeOk) {
-        _lastWorkspaceEvalKey = evalKey;
-        _lastWorkspaceEvalAt = now;
-        await evaluateWorkspaceState();
-      }
-
-      updateModeBanner();
-      updateResyncWarning();
-      refreshSendButtonsState();
+      applyActiveSheet_(ws.id, ws.name);
     });
   } catch (err) {
     console.warn("detectActiveWorksheet error", err);
-  } finally {
-    if (showLoader) setGlobalLoading(false);
   }
+  refreshUI();
 }
 
-// Update create workspace name from active Excel tab (always overwrite)
-function updateCreateWorkspaceNameFromActive(activeName) {
-  const input = $("create_workspace_name");
-  if (input && activeName) {
-    input.value = activeName;
-  }
+function lineValuesHaveAny_(vals) {
+  return vals.some(v => v && String(v).trim().length);
 }
 
-// ----------------- WORKSPACE STATE / WARNINGS -----------------
+// Reads the receiver cells from the ACTIVE worksheet. No network.
+// signature = fingerprint of every value that gets sent, used to spot edits.
+async function readExcelSnapshot_() {
+  let snap = null;
+  await Excel.run(async (ctx) => {
+    const ws = ctx.workbook.worksheets.getActiveWorksheet();
+    ws.load("name,id");
 
-async function evaluateWorkspaceState() {
-  const activeName =
-    currentActiveWorksheet ||
-    ($("activeSheetName") ? $("activeSheetName").textContent : "");
+    const headerRanges = {};
+    HEADER_FIELDS.forEach(h => {
+      const rng = ws.getRange(h.cell);
+      rng.load("values");
+      headerRanges[h.key] = rng;
+    });
 
-  const identifier = extractIdentifierFromName(activeName);
-  workspaceState = { type: "unknown", identifier: identifier || null, matchedTab: null };
+    const endRow = ITEM_START_ROW + MAX_LINE_ITEMS - 1;
+    const lineRange = ws.getRange(`A${ITEM_START_ROW}:F${endRow}`);
+    lineRange.load("values");
 
-  // Prefer the actual Receiver / PO values (these are what get written to RECEIVER RECORDS)
-  const rrFromUI = ($("c_rcv") && $("c_rcv").value ? $("c_rcv").value : "").trim();
-  const poFromUI = ($("c_po") && $("c_po").value ? $("c_po").value : "").trim();
-  const dateFromUI = ($("c_dr") && $("c_dr").value ? $("c_dr").value : "").trim();
+    await ctx.sync();
 
-  if (!activeName) {
-    workspaceState.type = "unknown";
-    return;
-  }
+    const header = {};
+    HEADER_FIELDS.forEach(h => {
+      const rng = headerRanges[h.key];
+      const v = rng && rng.values && rng.values[0] ? rng.values[0][0] : "";
+      header[h.key] = v == null ? "" : String(v);
+    });
 
-  // If we have RR + PO + a selected sheet, we can *directly* determine Create vs Modify
-  // by checking RECEIVER RECORDS (this is the source of truth).
-  if (selectedSheetId && rrFromUI && poFromUI) {
-    const key = `${selectedSheetId}|${rrFromUI}|${poFromUI}|${dateFromUI || ""}`;
-    const now = Date.now();
+    const lines = [];
+    const values = lineRange.values || [];
+    for (let i = 0; i < values.length; i++) {
+      const row = values[i] || [];
+      const itemVal  = row[0];
+      const comVal   = row[1];
+      const grossVal = row[2];
+      const tareVal  = row[3];
+      const costVal  = row[5]; // F column
 
-    // Cache + de-dupe in-flight requests to avoid hammering the backend (which then hammers Sheets)
-    if (_rrStatusCache.key === key && (now - _rrStatusCache.at) < RECEIVER_STATUS_TTL_MS && _rrStatusCache.exists !== null) {
-      receiverRecordExists = _rrStatusCache.exists;
-    } else {
-      try {
-        if (_rrStatusInFlight && _rrStatusInFlight.key === key) {
-          receiverRecordExists = await _rrStatusInFlight.promise;
-        } else {
-          const qs = new URLSearchParams({
-            sheetId: selectedSheetId,
-            rrNumber: rrFromUI,
-            poNumber: poFromUI
-          });
-          if (dateFromUI) qs.set("dateReceived", dateFromUI);
-
-          _rrStatusInFlight = {
-            key,
-            promise: (async () => {
-              const stResp = await fetch(`${BACKEND}/api/receiverRecordStatus?${qs.toString()}`, { credentials: "include" });
-              const stJson = await stResp.json();
-              return !!stJson.exists;
-            })()
-          };
-
-          receiverRecordExists = await _rrStatusInFlight.promise;
-        }
-
-        _rrStatusCache = { key, at: Date.now(), exists: receiverRecordExists };
-      } catch (e) {
-        // If the status check fails, don't block the UI; just treat as "not uploaded"
-        receiverRecordExists = false;
-        _rrStatusCache = { key: null, at: 0, exists: null };
-      } finally {
-        if (_rrStatusInFlight && _rrStatusInFlight.key === key) _rrStatusInFlight = null;
+      if (lineValuesHaveAny_([itemVal, comVal, grossVal, tareVal, costVal])) {
+        lines.push({
+          row:   ITEM_START_ROW + i,
+          item:  itemVal  == null ? "" : String(itemVal),
+          com:   comVal   == null ? "" : String(comVal),
+          gross: grossVal == null ? "" : String(grossVal),
+          tare:  tareVal  == null ? "" : String(tareVal),
+          cost:  costVal  == null ? "" : String(costVal)
+        });
       }
     }
 
-    // We have enough information to set the mode.
-    workspaceState.type = receiverRecordExists ? "existing" : "new-valid";
-    workspaceState.identifier = identifier || null;
-    workspaceState.matchedTab = identifier ? findTabByIdentifier(identifier) : null;
+    snap = {
+      sheetId: ws.id,
+      sheetName: ws.name || "",
+      header,
+      lines,
+      signature: JSON.stringify([header, lines])
+    };
+  });
+  return snap;
+}
+
+// Compares Excel with the last read. Runs on tab switch, cell edit, rename,
+// Resync and when the pane gets focus. Excel only — never calls Google Sheets.
+async function checkExcelForChanges_() {
+  if (createInFlight || sendInFlight) return;
+
+  if (!lastRead) {
+    await detectActiveWorksheet();
     return;
   }
 
-  // If we don't have RR+PO yet, we cannot accurately check RECEIVER RECORDS.
-  // Title identifier is just a hint/guardrail until the receiver is read.
-  if (!identifier) {
-    workspaceState.type = "title-invalid";
-    workspaceState.identifier = null;
-
-    if (selectedSheetId) {
-      setStatus(
-        "Active Excel tab name does not contain -MM-DD-XXX identifier (e.g. NOVA -1-17-025 or NOVA - 1-17-025). " +
-        "Read the receiver to fill Receiver # and PO#, or rename the tab. " +
-        "Send is disabled until Receiver # + PO# are present."
-      );
+  try {
+    const snap = await readExcelSnapshot_();
+    applyActiveSheet_(snap.sheetId, snap.sheetName);
+    if (snap.sheetId === lastRead.sheetId) {
+      excelChangedSinceRead = snap.signature !== lastRead.signature;
     }
-    return;
+  } catch (err) {
+    console.warn("checkExcelForChanges error", err);
   }
-
-  // We have an identifier but still lack RR+PO, so we can't check RECEIVER RECORDS.
-  workspaceState.type = "needs-read";
-  workspaceState.identifier = identifier;
-  workspaceState.matchedTab = findTabByIdentifier(identifier);
+  refreshUI();
 }
 
+// ----------------- NAME / DATE HELPERS -----------------
 
-// extract identifier -MM-DD-XXX from name
-function extractIdentifierFromName(name) {
-  if (!name || typeof name !== "string") return null;
-  const m = name.match(ID_RE);
-  if (!m) return null;
-  return `-${m[1]}-${m[2]}-${m[3]}`;
+function isWorkspaceNameFormatValid(name) {
+  if (!name) return false;
+  return ID_RE.test(String(name).trim());
 }
 
-// Attempt to find a tab whose title contains the identifier (in a few padded forms)
-function findTabByIdentifier(identifier) {
-  if (!identifier || !currentTabs || !currentTabs.length) return null;
-  const parts = identifier.split("-");
-  // parts: ["", MM, DD, XXX]
-  const mm = parts[1];
-  const dd = parts[2];
-  const xxx = parts[3];
-
-  const mmP = mm.padStart(2, "0");
-  const ddP = dd.padStart(2, "0");
-
-  const candidates = new Set();
-  candidates.add(identifier);                // -M-D-XXX
-  candidates.add(`-${mmP}-${dd}-${xxx}`);
-  candidates.add(`-${mm}-${ddP}-${xxx}`);
-  candidates.add(`-${mmP}-${ddP}-${xxx}`);
-  candidates.add(`${mm}-${dd}-${xxx}`);
-  candidates.add(`${mmP}-${ddP}-${xxx}`);
-
-  for (const t of currentTabs) {
-    const lower = t.toLowerCase();
-    for (const idf of candidates) {
-      if (!idf) continue;
-      if (lower.includes(idf.toLowerCase())) return t;
-    }
-  }
-  return null;
+// Excel hands dates over as serial numbers (e.g. 46336). Show them as MM/DD/YYYY.
+// Display only — the raw value is what gets sent, exactly as before.
+function formatDateForDisplay_(value) {
+  const s = value == null ? "" : String(value).trim();
+  if (!s) return "";
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 20000 || n > 80000) return s;
+  const d = new Date(Date.UTC(1899, 11, 30) + Math.floor(n) * 86400000);
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${mm}/${dd}/${d.getUTCFullYear()}`;
 }
+
+// ----------------- COMMODITY PARSING -----------------
 
 // Normalize commodity text, capture any parenthetical notes, and detect GENERATED prefix
 function parseCommodityForNotes(raw) {
-  // Used ONLY for Master logic (and optional auto-notes),
-  // NOT for the 1:1 receiver copy COM text.
+  // Used ONLY for Master logic.
   const result = {
     material: "",
     note: "",
@@ -539,17 +586,14 @@ function parseCommodityForNotes(raw) {
   // - Require P + at least 4 digits so we don't grab random junk.
   const poMatch = text.match(/\bPO\s*#\s*(P\d{4,})\b/i);
   if (poMatch) {
-    const fullMatch = poMatch[0];     // e.g. "PO# P012345"
-    const pCode     = poMatch[1];     // e.g. "P012345"
-    const idx       = poMatch.index;
+    const pCode = poMatch[1];     // e.g. "P012345"
+    const idx   = poMatch.index;
 
     result.poOverride = pCode.trim().toUpperCase();
 
     // For Master material: drop everything from the PO segment onward
     // so any receiver-specific words after the PO do NOT affect Master grouping.
     text = text.slice(0, idx).trim();
-    // (The full raw text still goes to the receiver copy unchanged,
-    //  via buildValuesMapFromUI.)
   }
 
   // Normalize remaining commodity as the Master "material"
@@ -562,305 +606,81 @@ function parseCommodityForNotes(raw) {
   return result;
 }
 
+// ----------------- LINE HELPERS / TOTALS -----------------
 
-function updateModeBanner() {
-  const banner = $("modeBanner");
-  if (!banner) return;
-
-  const activeName =
-    currentActiveWorksheet ||
-    ($("activeSheetName") ? $("activeSheetName").textContent : "");
-
-  // If we don't know the Excel tab yet or no sheet selected, hide
-  if (!activeName || !selectedSheetId) {
-    banner.className = "mode-banner hidden";
-    banner.querySelector(".text").textContent = "Waiting for Excel tab...";
-    return;
-  }
-
-  const labelEl = banner.querySelector(".label");
-  const textEl = banner.querySelector(".text");
-
-  if (!labelEl || !textEl) return;
-
-  if (workspaceState.type === "title-invalid") {
-    banner.className = "mode-banner invalid";
-    labelEl.textContent = "Mode";
-    textEl.textContent =
-      "Cannot determine mode yet. Fill Receiver # and PO# (or rename the tab to include -MM-DD-XXX).";
-  } else if (workspaceState.type === "existing") {
-    banner.className = "mode-banner modify";
-    labelEl.textContent = "Modifying";
-    textEl.textContent =
-      'Receiver already exists in "RECEIVER RECORDS" (Receiver # + month/day). Will update Master Receivers and refresh Date Uploaded.';
-  } else if (workspaceState.type === "new-valid") {
-    banner.className = "mode-banner create";
-    labelEl.textContent = "Creating";
-    textEl.textContent =
-      'Receiver not found in "RECEIVER RECORDS" (Receiver # + PO#). Will create a new upload record, then update Master Receivers.';
-  } else if (workspaceState.type === "needs-read") {
-    banner.className = "mode-banner";
-    labelEl.textContent = "Mode";
-    textEl.textContent =
-      "Read the receiver (Receiver # + PO#) to determine Creating vs Modifying.";
-  } else {
-    banner.className = "mode-banner";
-    labelEl.textContent = "Mode";
-    textEl.textContent = "Waiting for workspace status…";
-  }
+function lineHasAny_(li) {
+  if (!li) return false;
+  return !!(
+    (li.item && li.item.trim().length) ||
+    (li.com && li.com.trim().length) ||
+    (li.gross && li.gross.trim().length) ||
+    (li.tare && li.tare.trim().length) ||
+    (li.cost && li.cost.trim().length)
+  );
 }
 
-// Warning about “data read from a different sheet”
-function updateResyncWarning() {
-  const warningEl = $("sheetChangeWarning");
-  if (!warningEl) return;
+// allow "$2.38", "1,234.5", etc.
+function parseNumberOrNull_(val) {
+  if (val == null) return null;
+  const s = String(val).replace(/[^0-9.\-]/g, "").trim();
+  if (!s) return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
 
-  const currentName = currentActiveWorksheet ||
-    ($("activeSheetName") ? $("activeSheetName").textContent : "");
+// Totals over VALID lines only. A line is valid when it has an item code,
+// a gross weight, a cost, and a net weight above zero.
+// Split-PO nuance: when TARE is blank, GROSS already is the net weight.
+// "cost" here is the same number that is sent as the receiver's net total.
+function computeTotals_() {
+  const totals = { lines: 0, valid: 0, gross: 0, tare: 0, net: 0, cost: 0, skipped: [] };
 
-  let showWarning = false;
-  let msg = "";
+  for (const li of createLineItems) {
+    if (!lineHasAny_(li)) continue;
+    totals.lines++;
 
-  if (hasAnyCreateData() &&
-      lastReadCreateSheetName &&
-      lastReadCreateSheetName !== currentName) {
-    showWarning = true;
-    msg = `Excel sheet changed. Click "Read Data From Excel" again before sending.`;
+    const itemCode = (li.item || "").trim();
+    if (!itemCode) {
+      totals.skipped.push({ row: li.row, reason: "no item code" });
+      continue;
+    }
+
+    const gross = parseNumberOrNull_(li.gross);
+    const tare  = parseNumberOrNull_(li.tare);  // optional
+    const price = parseNumberOrNull_(li.cost);
+    if (gross == null || price == null) {
+      totals.skipped.push({ row: li.row, reason: gross == null ? "no gross weight" : "no cost" });
+      continue;
+    }
+
+    const net = (tare == null) ? gross : (gross - tare);
+    if (!Number.isFinite(net) || net <= 0) {
+      totals.skipped.push({ row: li.row, reason: "net weight is zero or less" });
+      continue;
+    }
+
+    totals.valid++;
+    totals.gross += gross;
+    totals.tare += (tare == null ? 0 : tare);
+    totals.net += net;
+    totals.cost += net * price;
   }
 
-
-  if (showWarning) {
-    warningEl.textContent = msg;
-    show(warningEl);
-  } else {
-    warningEl.textContent = "";
-    hide(warningEl);
-  }
+  return totals;
 }
 
-// ----------------- MULTI-ROW LINE ITEMS HELPERS -----------------
-
-function addLineItem() {
-  createLineItems.push({ item: "", com: "", gross: "", tare: "", cost: "" });
-  renderLineItems();
-  updateNetTotalDisplay();
-  refreshSendButtonsState();
-}
-
-// Derived net weight for UI (handles split-PO receivers where tare is blank)
-function computeNetWeightForLine_(li) {
-  const g = (li && li.gross != null) ? String(li.gross).trim() : "";
-  const t = (li && li.tare != null) ? String(li.tare).trim() : "";
-
-  const gNum = Number(g);
-  const tNum = Number(t);
-  if (g === "" || isNaN(gNum)) return "";
-
-  // If tare is blank, treat gross as the net weight (common on split-PO rows)
-  if (t === "" || isNaN(tNum)) return gNum;
-
-  return gNum - tNum;
-}
-
-function updateNetTotalDisplay() {
-  const valEl = $("netTotalValue");
-  if (!valEl) return;
-
-  let total = 0;
-  createLineItems.forEach(li => {
-    const net = computeNetWeightForLine_(li);
-    const c = (li && li.cost != null) ? String(li.cost).trim() : "";
-    const costNum = Number(c);
-    if (net === "" || isNaN(costNum)) return;
-    total += Number(net) * costNum;
-  });
-
+function formatWeight_(n) {
   try {
-    valEl.textContent = total.toLocaleString(undefined, { style: "currency", currency: "USD" });
+    return Number(n).toLocaleString(undefined, { maximumFractionDigits: 2 });
   } catch (_) {
-    valEl.textContent = "$" + total.toFixed(2);
+    return String(n);
   }
 }
 
-function renderLineItems() {
-  const container = $("createLineItemsContainer");
-  const items = createLineItems;
-
-  if (!container) return;
-  container.innerHTML = "";
-
-  if (!items.length) {
-    const p = document.createElement("p");
-    p.className = "status-msg";
-    p.textContent = "No line items detected. Use \"Add Line\" to add one.";
-    container.appendChild(p);
-    return;
-  }
-
-  items.forEach((li, idx) => {
-    const row = document.createElement("div");
-    row.className = "line-item-row";
-    row.dataset.index = String(idx);
-
-    LINE_KEYS.forEach(key => {
-      const input = document.createElement("input");
-      input.value = li[key] || "";
-      input.classList.add(`li-${key}`);
-
-      if (key === "gross" || key === "tare" || key === "cost") {
-        input.classList.add("li-num");
-      }
-
-      input.addEventListener("input", () => {
-        li[key] = input.value;
-        // Update derived fields in real-time
-        if (key === "gross" || key === "tare" || key === "cost") {
-          // Net is derived from gross/tare; recompute if either changes
-          if (netInput) {
-            const nw = computeNetWeightForLine_(li);
-            netInput.value = (nw === "" ? "" : String(nw));
-          }
-          updateNetTotalDisplay();
-        }
-        refreshSendButtonsState();
-      });
-
-      // Insert NET column after TARE
-      if (key === "tare") {
-        row.appendChild(input);
-
-        // Derived NET field (readonly)
-        var netInput = document.createElement("input");
-        const nw = computeNetWeightForLine_(li);
-        netInput.value = (nw === "" ? "" : String(nw));
-        netInput.readOnly = true;
-        netInput.classList.add("li-net");
-        row.appendChild(netInput);
-
-        return; // continue to next key
-      }
-
-      row.appendChild(input);
-    });
-
-    const removeBtn = document.createElement("button");
-    removeBtn.type = "button";
-    removeBtn.className = "secondary-btn small-btn";
-    removeBtn.textContent = "×";
-    removeBtn.addEventListener("click", () => {
-      items.splice(idx, 1);
-      renderLineItems();
-      updateNetTotalDisplay();
-      refreshSendButtonsState();
-    });
-    row.appendChild(removeBtn);
-
-    container.appendChild(row);
-  });
-
-  updateNetTotalDisplay();
-}
-
-// ----------------- BUILD VALUES MAP FROM UI -----------------
-
-function buildValuesMapFromUI() {
-  const valuesMap = {};
-
-  // headers
-  HEADER_FIELDS.forEach(h => {
-    const el = $(h.cId);
-    valuesMap[h.cell] = el ? el.value || "" : "";
-  });
-
-  // line items
-  createLineItems.forEach((li, idx) => {
-    const row = ITEM_START_ROW + idx;
-    const any =
-      (li.item && li.item.trim().length) ||
-      (li.com && li.com.trim().length) ||
-      (li.gross && li.gross.trim().length) ||
-      (li.tare && li.tare.trim().length) ||
-      (li.cost && li.cost.trim().length);
-
-    if (!any) return;
-
-    const rawCom = li.com || "";
-    const parsed = parseCommodityForNotes(rawCom);
-
-    // RECEIVER COPY: must be 1:1 with Excel input.
-    valuesMap[`${ITEM_COLUMNS.item}${row}`]  = li.item  || "";
-    valuesMap[`${ITEM_COLUMNS.com}${row}`]   = rawCom;         // keep exact text
-    valuesMap[`${ITEM_COLUMNS.gross}${row}`] = li.gross || "";
-    valuesMap[`${ITEM_COLUMNS.tare}${row}`]  = li.tare  || "";
-    valuesMap[`${ITEM_COLUMNS.cost}${row}`]  = li.cost  || "";
-
-    // Optional: still use parsed note for MATERIAL NOTES column
-    if (parsed.note) {
-      valuesMap[`${ITEM_COLUMNS.notes}${row}`] = parsed.note;
-    }
-  });
-
-  return valuesMap;
-}
-
-
-// ----------------- WRITE TO SHEETS (BATCH + FALLBACK) -----------------
-
-async function writeFieldsToTab(sheetId, tabName, valuesMap) {
-  const batch = Object.entries(valuesMap).map(([cell, value]) => ({ cell, value }));
-
-  // try batch first
+function formatMoney_(n) {
   try {
-    const res = await fetch(`${BACKEND}/api/writeBatch`, {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sheetId, tabName, values: batch })
-    });
-    if (res.ok) return;
-
-    // fallback to individual calls
-    for (const it of batch) {
-      const r = await fetch(`${BACKEND}/api/writeCell`, {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          sheetId,
-          tabName,
-          cell: it.cell,
-          value: it.value
-        })
-      });
-      if (!r.ok) throw new Error("writeCell failed: " + r.status);
-    }
-  } catch (err) {
-    throw err;
+    return Number(n).toLocaleString(undefined, { style: "currency", currency: "USD" });
+  } catch (_) {
+    return "$" + Number(n).toFixed(2);
   }
-}
-
-// ----------------- “HAS DATA” HELPERS -----------------
-
-function hasAnyHeaderValues() {
-  for (const h of HEADER_FIELDS) {
-    const el = $(h.cId);
-    if (el && String(el.value || "").trim().length) return true;
-  }
-  return false;
-}
-
-function hasAnyLineItems() {
-  return createLineItems.some(li => {
-    return (
-      (li.item && li.item.trim().length) ||
-      (li.com && li.com.trim().length) ||
-      (li.gross && li.gross.trim().length) ||
-      (li.tare && li.tare.trim().length) ||
-      (li.cost && li.cost.trim().length)
-    );
-  });
-}
-
-function hasAnyCreateData() {
-  return hasAnyHeaderValues() || hasAnyLineItems();
 }

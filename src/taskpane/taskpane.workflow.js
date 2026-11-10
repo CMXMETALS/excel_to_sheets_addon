@@ -1,168 +1,127 @@
 /* global Excel */
 /*
   Workflow layer:
-  - read from Excel for the active worksheet
-  - orchestrate create/modify based on detected workspace state
-  - workspace name validation
-  - button enable / lock-out logic
+  - "Read data": read the receiver from Excel, then ONE check against RECEIVER RECORDS
+  - build the payloads for the Worker (unchanged shapes)
+  - send: update Master Receivers, then upsert RECEIVER RECORDS
+  - refreshUI(): single place that draws the pane and decides whether Send is allowed
 */
 
 let pendingSendPlan = null;
 
+const CHECK_ICON_ =
+  '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" ' +
+  'stroke-linecap="round" stroke-linejoin="round" role="img" aria-label="Done"><path d="M20 6 9 17l-5-5"/></svg>';
+
 // ----------------- READ FROM EXCEL -----------------
+
+// The only place (besides Send) that talks to Google Sheets.
+// Returns { exists: true|false|null, problem: string|null }.
+async function fetchReceiverRecordStatus_(rrNumber, poNumber, dateReceived) {
+  try {
+    const qs = new URLSearchParams({
+      sheetId: selectedSheetId,
+      rrNumber,
+      poNumber
+    });
+    if (dateReceived) qs.set("dateReceived", dateReceived);
+
+    const res = await fetch(`${BACKEND}/api/receiverRecordStatus?${qs.toString()}`, { credentials: "include" });
+    if (res.status === 401) return { exists: null, problem: "auth" };
+    if (res.status === 404) return { exists: null, problem: "This Sheets file has no RECEIVER RECORDS tab." };
+    if (!res.ok) return { exists: null, problem: "Could not check Receiver Records (" + res.status + ")." };
+
+    const json = await res.json();
+    return { exists: !!json.exists, problem: null };
+  } catch (e) {
+    return { exists: null, problem: "network" };
+  }
+}
 
 async function readFieldsFromExcel_Create() {
   if (!selectedSheetId) {
-    setStatus("Select a Google Sheets file first.");
+    setStatus("Choose a Google Sheets file first.", "warn");
     return;
   }
-  if (createInFlight) return;
+  if (createInFlight || sendInFlight) return;
 
   createInFlight = true;
+  refreshUI();
+  setGlobalLoading(true, "Reading receiver from Excel…");
 
-  setStatus("Reading Reciever From Excel...");
   try {
-    await Excel.run(async (ctx) => {
-      const ws = ctx.workbook.worksheets.getActiveWorksheet();
-      ws.load("name");
+    // 1) Excel (local)
+    const snap = await readExcelSnapshot_();
 
-      // Header cells
-      const headerRanges = {};
-      HEADER_FIELDS.forEach(h => {
-        const rng = ws.getRange(h.cell);
-        rng.load("values");
-        headerRanges[h.key] = rng;
-      });
+    // Always take the tab's CURRENT name + id from this read. This is what fixes
+    // "renamed the tab, re-read, Send still greyed out".
+    applyActiveSheet_(snap.sheetId, snap.sheetName);
 
-      // Line items block (A18:F...)
-      const endRow = ITEM_START_ROW + MAX_LINE_ITEMS - 1;
-      const lineRange = ws.getRange(`A${ITEM_START_ROW}:F${endRow}`);
-      lineRange.load("values");
+    headerValues = snap.header;
+    createLineItems = snap.lines;
+    lastRead = {
+      sheetId: snap.sheetId,
+      sheetName: snap.sheetName,
+      fileId: selectedSheetId,
+      signature: snap.signature
+    };
+    excelChangedSinceRead = false;
+    receiverRecordExists = null;
 
-      await ctx.sync();
+    // 2) Google Sheets (one request): new receiver or update?
+    const rr = (headerValues.rcv || "").trim();
+    const po = (headerValues.po || "").trim();
+    const dr = (headerValues.dr || "").trim();
 
-      // Fill header inputs
-      HEADER_FIELDS.forEach(h => {
-        const el = $(h.cId);
-        const rng = headerRanges[h.key];
-        const v = rng && rng.values && rng.values[0] ? rng.values[0][0] : "";
-        if (el) el.value = v == null ? "" : String(v);
-      });
+    let problem = null;
+    if (rr && po) {
+      setGlobalLoading(true, "Checking Receiver Records…");
+      const st = await fetchReceiverRecordStatus_(rr, po, dr);
+      receiverRecordExists = st.exists;
+      problem = st.problem;
+    }
 
-      // Track where these Create values came from
-      lastReadCreateSheetName = ws.name || "";
+    if (problem === "auth") {
+      handleAuthLost_();
+      return;
+    }
 
-      // Line items
-      createLineItems = [];
-      const values = lineRange.values || [];
-      for (let i = 0; i < values.length; i++) {
-        const row = values[i] || [];
-        const itemVal  = row[0];
-        const comVal   = row[1];
-        const grossVal = row[2];
-        const tareVal  = row[3];
-        const costVal  = row[5]; // F column
-
-        const any =
-          (itemVal && String(itemVal).trim().length) ||
-          (comVal && String(comVal).trim().length) ||
-          (grossVal && String(grossVal).trim().length) ||
-          (tareVal && String(tareVal).trim().length) ||
-          (costVal && String(costVal).trim().length);
-
-        if (any) {
-          createLineItems.push({
-            item:  itemVal  == null ? "" : String(itemVal),
-            com:   comVal   == null ? "" : String(comVal),
-            gross: grossVal == null ? "" : String(grossVal),
-            tare:  tareVal  == null ? "" : String(tareVal),
-            cost:  costVal  == null ? "" : String(costVal)
-          });
-        }
-      }
-
-        renderLineItems();
-    });
-
-    setStatus("Fields Copied From Excel. You Can Edit Them Before Sending.");
+    const n = createLineItems.length;
+    const readMsg = `Read ${n} line${n === 1 ? "" : "s"} from "${snap.sheetName}".`;
+    if (problem === "network") {
+      setStatus(readMsg + " Could not reach the server to check Receiver Records; it will be checked when you send.", "warn");
+    } else if (problem) {
+      setStatus(readMsg + " " + problem, "warn");
+    } else {
+      setStatus(readMsg, "success");
+    }
   } catch (err) {
     console.error(err);
-    setStatus("Failed to read Excel fields: " + (err.message || err));
+    setStatus("Could not read Excel: " + (err.message || err) + " If a cell is being edited, press Enter and try again.", "error");
   } finally {
     createInFlight = false;
-    invalidateReceiverRecordStatusCache_();
-    await evaluateWorkspaceState();
-    updateModeBanner();
-    updateResyncWarning();
-    refreshSendButtonsState();
+    setGlobalLoading(false);
+    refreshUI();
   }
 }
 
-// ----------------- CREATE / MODIFY WORKSPACE -----------------
-
-function isWorkspaceNameFormatValid(name) {
-  if (!name) return false;
-  return ID_RE.test(name.trim());
-}
+// ----------------- PAYLOADS -----------------
 
 function buildReceiverRecordPayloadFromUI() {
-  const pfEl  = $("c_pf");
-  const drEl  = $("c_dr");
-  const poEl  = $("c_po");
-  const rcvEl = $("c_rcv");
-
-  const purchaseFrom = pfEl  ? String(pfEl.value || "").trim()  : "";
-  const dateReceived = drEl  ? String(drEl.value || "").trim()  : "";
-  const poNumber     = poEl  ? String(poEl.value || "").trim()  : "";
-  const rrNumber     = rcvEl ? String(rcvEl.value || "").trim() : "";
+  const purchaseFrom = String(headerValues.pf  || "").trim();
+  const dateReceived = String(headerValues.dr  || "").trim();
+  const poNumber     = String(headerValues.po  || "").trim();
+  const rrNumber     = String(headerValues.rcv || "").trim();
 
   if (!rrNumber || !dateReceived) {
     return { payload: null, error: "Receiver # and Date Received are required to log RECEIVER RECORDS." };
   }
 
-  // Net Total = sum of (NET * PRICE) for valid, coded line items.
-  // IMPORTANT (split-PO nuance): when TARE is blank, the receiver template often has NET entered
-  // directly in the GROSS cell. In that case, treat GROSS as NET.
-  function parseNumberOrNull(val) {
-    if (val == null) return null;
-    // allow "$2.38", "1,234.5", etc.
-    const s = String(val).replace(/[^0-9.\-]/g, "").trim();
-    if (!s) return null;
-    const n = Number(s);
-    return Number.isFinite(n) ? n : null;
-  }
-
-  let netTotal = 0;
-  let sawAny = false;
-
-  for (const li of createLineItems) {
-    if (!li) continue;
-
-    const hasAny =
-      (li.item && li.item.trim().length) ||
-      (li.com && li.com.trim().length) ||
-      (li.gross && li.gross.trim().length) ||
-      (li.tare && li.tare.trim().length) ||
-      (li.cost && li.cost.trim().length);
-    if (!hasAny) continue;
-
-    const itemCode = (li.item || "").trim();
-    if (!itemCode) continue; // only valid, coded line items
-
-    const gross = parseNumberOrNull(li.gross);
-    const tare  = parseNumberOrNull(li.tare);  // optional
-    const price = parseNumberOrNull(li.cost);
-    if (gross == null || price == null) continue;
-
-    const net = (tare == null) ? gross : (gross - tare);
-    if (!Number.isFinite(net) || net <= 0) continue;
-
-    netTotal += (net * price);
-    sawAny = true;
-  }
+  // Net Total = sum of (NET * PRICE) for valid, coded line items (see computeTotals_).
+  const totals = computeTotals_();
 
   // If we couldn't compute it reliably, send null and let the server write a live formula instead.
-  const netTotalOut = sawAny ? Number(netTotal.toFixed(2)) : null;
+  const netTotalOut = totals.valid > 0 ? Number(totals.cost.toFixed(2)) : null;
 
   return {
     payload: {
@@ -178,20 +137,11 @@ function buildReceiverRecordPayloadFromUI() {
 }
 
 function buildMasterPayloadFromUI() {
-  // Header inputs
-  const pfEl       = $("c_pf");
-  const drEl       = $("c_dr");
-  const carrierEl  = $("c_carrier");
-  const poEl       = $("c_po");
-  const rcvEl      = $("c_rcv");
-  const verEl      = $("c_ver");
-
-  const supplier   = pfEl      ? String(pfEl.value || "").trim()      : "";
-  const date       = drEl      ? String(drEl.value || "").trim()      : "";
-  const carrier    = carrierEl ? String(carrierEl.value || "").trim() : "";
-  const poNumber   = poEl      ? String(poEl.value || "").trim()      : "";
-  const rrNumber   = rcvEl     ? String(rcvEl.value || "").trim()     : "";
-  const verifiedBy = verEl     ? String(verEl.value || "").trim()     : "";
+  const supplier = String(headerValues.pf      || "").trim();
+  const date     = String(headerValues.dr      || "").trim();
+  const carrier  = String(headerValues.carrier || "").trim();
+  const poNumber = String(headerValues.po      || "").trim();
+  const rrNumber = String(headerValues.rcv     || "").trim();
 
   // If there is no RR or PO, we can't meaningfully update Master.
   if (!rrNumber || !poNumber) {
@@ -202,23 +152,12 @@ function buildMasterPayloadFromUI() {
   let generatedMissingCode = null;
 
   function parseNumber(val) {
-    if (val == null) return "";
-    // allow "$2.38", "1,234.5", etc.
-    const s = String(val).replace(/[^0-9.\-]/g, "").trim();
-    if (!s) return "";
-    const n = Number(s);
-    return Number.isFinite(n) ? n : "";
+    const n = parseNumberOrNull_(val);
+    return n == null ? "" : n;
   }
 
   for (const li of createLineItems) {
-    const hasAny =
-      (li.item && li.item.trim().length) ||
-      (li.com && li.com.trim().length) ||
-      (li.gross && li.gross.trim().length) ||
-      (li.tare && li.tare.trim().length) ||
-      (li.cost && li.cost.trim().length);
-
-    if (!hasAny) continue;
+    if (!lineHasAny_(li)) continue;
 
     const parsed   = parseCommodityForNotes(li.com);
     const itemCode = (li.item || "").trim();
@@ -248,7 +187,7 @@ function buildMasterPayloadFromUI() {
     const effectivePo = parsed.poOverride || poNumber;
 
     lines.push({
-      itemCode,                      // for server.js normalizedLines
+      itemCode,
       material: parsed.material || "",
       materialNotes: parsed.note || "",
       net: net === "" ? "" : net,
@@ -283,7 +222,7 @@ function buildMasterPayloadFromUI() {
       poStatus: "",
       poSageClosed: "",
       receiverSageEntry: "",
-      notes: "",            // header-level notes already live on receiver tab
+      notes: "",
       carrier,
       lines
     },
@@ -291,71 +230,84 @@ function buildMasterPayloadFromUI() {
   };
 }
 
-
-
 function ensureGeneratedRowsHaveCodes() {
   for (const li of createLineItems) {
-    const hasAny =
-      (li.item && li.item.trim().length) ||
-      (li.com && li.com.trim().length) ||
-      (li.gross && li.gross.trim().length) ||
-      (li.tare && li.tare.trim().length) ||
-      (li.cost && li.cost.trim().length);
-
-    if (!hasAny) continue;
+    if (!lineHasAny_(li)) continue;
 
     const parsed = parseCommodityForNotes(li.com);
     const itemCode = (li.item || "").trim();
 
     if (parsed.isGenerated && !itemCode) {
-      return `Generated line "${parsed.material || ""}" requires an item code.`;
+      return `Generated line "${parsed.material || ""}" (row ${li.row}) requires an item code.`;
     }
   }
+  return null;
+}
+
+// ----------------- SEND GATE -----------------
+
+// Returns the reason Send is not allowed, or null when it is. All local checks.
+function getSendBlocker_() {
+  if (!selectedSheetId) return "Choose a Google Sheets file.";
+  if (!lastRead) return "Read the receiver from Excel.";
+
+  if (lastRead.sheetId !== currentActiveWorksheetId) {
+    return "This is a different Excel tab than the one that was read. Read data from this tab.";
+  }
+  if (excelChangedSinceRead) {
+    return "Excel values changed since the last read. Read data again.";
+  }
+  if (lastRead.fileId !== selectedSheetId) {
+    return "Sheets file changed since the last read. Read data again.";
+  }
+
+  if (!isWorkspaceNameFormatValid(currentActiveWorksheet)) {
+    return "Rename the Excel tab so it ends with -MM-DD-XXX (e.g. NOVA -1-17-025).";
+  }
+
+  const rr = (headerValues.rcv || "").trim();
+  const po = (headerValues.po || "").trim();
+  const dr = (headerValues.dr || "").trim();
+  if (!rr || !po) return "Receiver # (cell E12) and Our PO # (cell E11) are required.";
+  if (!dr) return "Date received (cell B12) is required.";
+
+  const generatedError = ensureGeneratedRowsHaveCodes();
+  if (generatedError) return generatedError;
 
   return null;
 }
 
 function buildSendPlan() {
-  if (!selectedSheetId) {
-    return { ok: false, message: "Select a Google Sheets file first." };
-  }
+  const blocker = getSendBlocker_();
+  if (blocker) return { ok: false, message: blocker };
 
-  const wsNameInput = $("create_workspace_name");
-  const name = (wsNameInput && wsNameInput.value || "").trim();
-
-  if (!name) {
-    return { ok: false, message: "Workspace name is empty. Rename the Excel tab so it includes -MM-DD-XXX." };
-  }
-  if (!isWorkspaceNameFormatValid(name)) {
-    return { ok: false, message: "Excel tab name must include -MM-DD-XXX (e.g. NOVA -1-17-025 or NOVA - 1-17-025)." };
-  }
-  if (workspaceState.type === "title-invalid") {
-    return { ok: false, message: "Rename the Excel tab to include -MM-DD-XXX before sending." };
-  }
-  if (!hasAnyCreateData()) {
-    return { ok: false, message: "Nothing to send yet. Fill some header or line items first." };
-  }
-
-  const currentName = currentActiveWorksheet;
-  if (lastReadCreateSheetName && lastReadCreateSheetName !== currentName) {
-    return { ok: false, message: 'Excel sheet changed. Click "Read Data From Excel" again before sending.' };
-  }
-
-  const generatedError = ensureGeneratedRowsHaveCodes();
-  if (generatedError) {
-    return { ok: false, message: generatedError };
-  }
-
-  // We no longer create a 1:1 receiver tab copy in Sheets. Sending always:
+  // Sending always:
   // 1) updates Master Receivers, and
   // 2) upserts a row in RECEIVER RECORDS.
-  return { ok: true, action: "send", workspaceName: name };
+  return { ok: true, action: "send", workspaceName: currentActiveWorksheet };
 }
 
-function openSendReviewModal() {
+async function openSendReviewModal() {
+  if (sendInFlight || createInFlight) return;
+
+  // Last local check before sending: is Excel still what we read? (no network)
+  try {
+    const snap = await readExcelSnapshot_();
+    applyActiveSheet_(snap.sheetId, snap.sheetName);
+    if (lastRead && snap.sheetId === lastRead.sheetId) {
+      excelChangedSinceRead = snap.signature !== lastRead.signature;
+    }
+  } catch (err) {
+    console.warn("pre-send Excel check failed", err);
+    setStatus("Could not check Excel before sending. If a cell is being edited, press Enter and try again.", "warn");
+    refreshUI();
+    return;
+  }
+  refreshUI();
+
   const plan = buildSendPlan();
   if (!plan.ok) {
-    setStatus(plan.message || "Unable to send.");
+    setStatus(plan.message || "Unable to send.", "warn");
     return;
   }
 
@@ -364,13 +316,24 @@ function openSendReviewModal() {
   const title = $("actionModalTitle");
   const body = $("actionModalBody");
 
+  const totals = computeTotals_();
+  const rr = (headerValues.rcv || "").trim();
+  const po = (headerValues.po || "").trim();
+
   if (title) title.textContent = "Send receiver to Google Sheets";
 
   if (body) {
+    const action =
+      receiverRecordExists === true
+        ? "This receiver is already in RECEIVER RECORDS. Sending updates its row and its Master Receivers lines."
+        : receiverRecordExists === false
+          ? "This is a new receiver. Sending adds it to RECEIVER RECORDS and Master Receivers."
+          : "Sending updates Master Receivers and adds or updates the RECEIVER RECORDS row.";
+
     body.textContent =
-      "This will update Master Receivers and log the upload in the RECEIVER RECORDS tab " +
-      "(Receiver #, PO#, Purchase From, Date Received, Date Uploaded). " +
-      "If this receiver already exists in RECEIVER RECORDS (same RR# + same month/day), Date Uploaded will be refreshed.";
+      `Receiver # ${rr} · PO ${po}\n` +
+      `Total cost ${formatMoney_(totals.cost)} (${totals.valid} valid line${totals.valid === 1 ? "" : "s"})\n\n` +
+      action;
   }
 
   if (modal) modal.classList.remove("hidden");
@@ -382,53 +345,36 @@ function closeActionModal() {
   pendingSendPlan = null;
 }
 
+// ----------------- SEND -----------------
+
 async function confirmPendingSend() {
   if (!pendingSendPlan || sendInFlight) {
     closeActionModal();
     return;
   }
 
-  const plan = pendingSendPlan;
   closeActionModal();
 
   sendInFlight = true;
-  setButtonEnabled($("create_send"), false);
+  refreshUI();
   setGlobalLoading(true, "Sending receiver to Google Sheets…");
   setStatus("Sending to Google Sheets…");
 
+  let sawAuthProblem = false;
+  let masterUpdated = false;
+
   try {
-    // 1) Determine whether this receiver already exists in RECEIVER RECORDS (RR# + month/day)
     const rrResult = buildReceiverRecordPayloadFromUI();
     if (rrResult.error) throw new Error(rrResult.error);
 
-    let recordExists = false;
-    try {
-      const qs = new URLSearchParams({
-        sheetId: selectedSheetId,
-        rrNumber: rrResult.payload.rrNumber,
-        poNumber: rrResult.payload.poNumber
-      });
-      if (rrResult.payload.dateReceived) qs.set("dateReceived", rrResult.payload.dateReceived);
-      const stRes = await fetch(`${BACKEND}/api/receiverRecordStatus?${qs.toString()}`, {
-        credentials: "include"
-      });
-      if (stRes.ok) {
-        const stJson = await stRes.json();
-        recordExists = !!stJson.exists;
-      }
-    } catch (e) {
-      // Non-fatal: we'll still upsert the record
-      console.warn("receiverRecordStatus failed:", e);
-    }
-
-    // 2) Update Master Receivers (existing logic stays the same)
     const masterResult = buildMasterPayloadFromUI();
     if (masterResult.error) throw new Error(masterResult.error);
 
-    let masterUpdated = false;
+    // 1) Update Master Receivers
     let masterFailStatus = null;
 
     if (masterResult.payload) {
+      setGlobalLoading(true, "Updating Master Receivers…");
       try {
         const mrRes = await fetch(`${BACKEND}/api/updateMasterFromReceiver`, {
           method: "POST",
@@ -437,100 +383,298 @@ async function confirmPendingSend() {
           body: JSON.stringify(masterResult.payload)
         });
         masterUpdated = mrRes.ok;
-        if (!mrRes.ok) masterFailStatus = mrRes.status;
+        if (!mrRes.ok) {
+          masterFailStatus = mrRes.status;
+          if (mrRes.status === 401) sawAuthProblem = true;
+        }
       } catch (e) {
         masterUpdated = false;
         masterFailStatus = e.message || String(e);
+        sawAuthProblem = true; // blocked request: may be an expired session
         console.warn("updateMasterFromReceiver error:", e);
       }
     }
 
-    // 3) Upsert RECEIVER RECORDS row (server stamps Date Uploaded)
-    const rrUpRes = await fetch(`${BACKEND}/api/upsertReceiverRecord`, {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(rrResult.payload)
-    });
-    if (!rrUpRes.ok) throw new Error("Receiver Records update failed: " + rrUpRes.status);
-
-    const modeText = recordExists ? "updated existing upload record" : "created new upload record";
-
-    // Keep UI state in sync immediately (and invalidate any cached status checks)
+    // 2) Upsert RECEIVER RECORDS row (server stamps Date Uploaded)
+    setGlobalLoading(true, "Logging in Receiver Records…");
+    let rrUpRes;
     try {
-      workspaceState.receiverRecordExists = true;
-      if (typeof invalidateReceiverRecordStatusCache_ === "function") invalidateReceiverRecordStatusCache_();
-      if (typeof updateModeBanner === "function") updateModeBanner();
-      if (typeof refreshSendButtonsState === "function") refreshSendButtonsState();
-    } catch (_) {}
-
-    if (!masterResult.payload) {
-      setStatus(`Done: ${modeText}. (Master not updated: missing RR#/PO#/lines.)`);
-    } else if (!masterUpdated) {
-      setStatus(`Done: ${modeText}, but Master Receivers update failed (${masterFailStatus}).`);
-    } else {
-      setStatus(`Done: ${modeText} and updated Master Receivers.`);
+      rrUpRes = await fetch(`${BACKEND}/api/upsertReceiverRecord`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(rrResult.payload)
+      });
+    } catch (e) {
+      sawAuthProblem = true;
+      throw new Error("Receiver Records update could not reach the server.");
+    }
+    if (!rrUpRes.ok) {
+      if (rrUpRes.status === 401) sawAuthProblem = true;
+      throw new Error("Receiver Records update failed: " + rrUpRes.status);
     }
 
-    await new Promise(r => setTimeout(r, 250));
-    await onSheetSelected();
+    // The server tells us whether it added a row or updated one.
+    let action = null;
+    try {
+      const upJson = await rrUpRes.json();
+      action = upJson && upJson.action ? upJson.action : null;
+    } catch (_) {}
+
+    let modeText;
+    if (action === "updated") modeText = "updated existing upload record";
+    else if (action === "appended") modeText = "created new upload record";
+    else modeText = receiverRecordExists ? "updated existing upload record" : "created new upload record";
+
+    // From here on this receiver exists in RECEIVER RECORDS.
+    receiverRecordExists = true;
+
+    if (!masterResult.payload) {
+      setStatus(`Done: ${modeText}. Master Receivers was not updated because no line has an item code.`, "warn");
+    } else if (!masterUpdated) {
+      const why = masterFailStatus === 429
+        ? "another update is in progress. Wait a few seconds and send again."
+        : `error ${masterFailStatus}. Send again to retry.`;
+      setStatus(`Done: ${modeText}, but Master Receivers was NOT updated: ${why}`, "error");
+    } else {
+      setStatus(`Done: ${modeText} and updated Master Receivers.`, "success");
+    }
   } catch (err) {
     console.error(err);
-    setStatus("Send failed: " + (err.message || err));
+    const extra = masterUpdated ? " Master Receivers was already updated; send again to finish the Receiver Records log." : "";
+    setStatus("Send failed: " + (err.message || err) + extra, "error");
   } finally {
     sendInFlight = false;
     setGlobalLoading(false);
-    refreshSendButtonsState();
+    refreshUI();
+  }
+
+  // If a request was rejected or blocked, find out whether the sign-in expired.
+  // (Only runs after a failure, so it adds no traffic to normal sends.)
+  if (sawAuthProblem) {
+    const check = await fetchSheetsList_();
+    if (!check.ok && (check.status === 401 || check.status === 403 || check.status === 0)) {
+      handleAuthLost_("Your sign-in expired, so the send did not finish. Connect again, then press Send again.");
+    }
   }
 }
 
+// ----------------- DRAW THE PANE -----------------
 
-
-function refreshSendButtonsState() {
-  let sendEnabled = false;
-
-  // Pre-conditions: auth + sheet selected
-  if (!lastAuthOk) {
-    setButtonEnabled($("create_send"), false);
-    setButtonEnabled($("create_prefill"), false);
-    setSectionLocked($("createPanel"), true);
-    return;
+function setStepBadge_(el, number, done) {
+  if (!el) return;
+  if (done) {
+    el.classList.add("done");
+    el.innerHTML = CHECK_ICON_;
+  } else {
+    el.classList.remove("done");
+    el.textContent = String(number);
   }
+}
 
-  setSectionLocked($("createPanel"), !selectedSheetId);
+function refreshUI() {
+  const hasFile = !!selectedSheetId;
+  const name = currentActiveWorksheet || "";
+  const nameValid = isWorkspaceNameFormatValid(name);
 
-  if (!selectedSheetId) {
-    setButtonEnabled($("create_send"), false);
-    setButtonEnabled($("create_prefill"), false);
-    return;
-  }
+  const onReadTab = !!lastRead && lastRead.sheetId === currentActiveWorksheetId;
+  const fileSame = !!lastRead && lastRead.fileId === selectedSheetId;
+  const fresh = onReadTab && fileSame && !excelChangedSinceRead;
+  const busy = createInFlight || sendInFlight;
 
-  const wsName = ($("create_workspace_name") && $("create_workspace_name").value || "").trim();
-  const nameValid = isWorkspaceNameFormatValid(wsName);
-  const currentName = currentActiveWorksheet;
-  const needsResync =
-    hasAnyCreateData() &&
-    lastReadCreateSheetName &&
-    currentName &&
-    lastReadCreateSheetName !== currentName;
+  // --- sections
+  setSectionLocked($("tabPanel"), !hasFile);
+  setSectionLocked($("createPanel"), !hasFile);
 
-  const generatedError = ensureGeneratedRowsHaveCodes();
+  // --- step 1
+  setStepBadge_($("step1Badge"), 1, hasFile);
 
-  // allow prefill regardless of format, but disable while read/send in flight
-  setButtonEnabled($("create_prefill"), !!selectedSheetId && !createInFlight && !sendInFlight);
+  // --- step 2: tab
+  const nameEl = $("activeSheetName");
+  if (nameEl) nameEl.textContent = name || "—";
 
-  if (!sendInFlight &&
-      selectedSheetId &&
-      // Title can be invalid, but we can still send once Receiver # + PO# are present.
-      (workspaceState.type !== "title-invalid" || ((($("c_rcv") && $("c_rcv").value) || "").trim() && (($("c_po") && $("c_po").value) || "").trim())) &&
-      nameValid &&
-      hasAnyCreateData() &&
-      !needsResync &&
-      !generatedError) {
-    if (workspaceState.type === "existing" || workspaceState.type === "new-valid") {
-      sendEnabled = true;
+  const nameWarn = $("tabNameWarning");
+  if (nameWarn) {
+    if (name && !nameValid) {
+      nameWarn.textContent =
+        "Tab name must end with -MM-DD-XXX (e.g. NOVA -1-17-025). Rename the tab, then press Resync if it does not update here.";
+      show(nameWarn);
+    } else {
+      nameWarn.textContent = "";
+      hide(nameWarn);
     }
   }
 
-  setButtonEnabled($("create_send"), sendEnabled);
+  // "Read data again" notice (never touches the Resync button)
+  const staleEl = $("sheetChangeWarning");
+  if (staleEl) {
+    let msg = "";
+    if (lastRead && !onReadTab) {
+      msg = `The last read came from another tab ("${lastRead.sheetName}"). Read data from this tab.`;
+    } else if (lastRead && excelChangedSinceRead) {
+      msg = "Excel values changed since the last read. Read data again before sending.";
+    } else if (lastRead && !fileSame) {
+      msg = "Sheets file changed since the last read. Read data again.";
+    }
+    staleEl.textContent = msg;
+    if (msg) show(staleEl);
+    else hide(staleEl);
+  }
+
+  // receiver details (only for the tab they were read from)
+  const detailsRow = $("detailsRow");
+  const detailsList = $("detailsList");
+  const toggle = $("detailsToggle");
+  if (onReadTab) {
+    const rr = (headerValues.rcv || "").trim();
+    const po = (headerValues.po || "").trim();
+    const pf = (headerValues.pf || "").trim();
+    const dr = formatDateForDisplay_(headerValues.dr);
+
+    const parts = [];
+    if (rr) parts.push("RR " + rr);
+    if (po) parts.push("PO " + po);
+    if (pf) parts.push(pf);
+    if (dr) parts.push(dr);
+    const summary = $("detailsSummary");
+    if (summary) summary.textContent = parts.length ? parts.join(" · ") : "No header values found on this tab.";
+
+    const required = { rcv: true, po: true, dr: true };
+    HEADER_FIELDS.forEach(h => {
+      const el = $(h.cId);
+      if (!el) return;
+      const raw = (headerValues[h.key] || "").trim();
+      const shown = h.key === "dr" ? formatDateForDisplay_(raw) : raw;
+      if (shown) {
+        el.textContent = shown;
+        el.classList.remove("missing");
+      } else {
+        el.textContent = required[h.key] ? `Missing (${h.cell})` : "—";
+        if (required[h.key]) el.classList.add("missing");
+        else el.classList.remove("missing");
+      }
+    });
+
+    show(detailsRow);
+    if (toggle && toggle.getAttribute("aria-expanded") === "true") show(detailsList);
+    else hide(detailsList);
+
+    [detailsRow, detailsList].forEach(el => {
+      if (!el) return;
+      if (fresh) el.classList.remove("is-stale");
+      else el.classList.add("is-stale");
+    });
+  } else {
+    hide(detailsRow);
+    hide(detailsList);
+  }
+
+  // read button
+  const readBtn = $("create_prefill");
+  if (readBtn) {
+    readBtn.textContent = onReadTab ? "Read data again" : "Read data from Excel";
+    if (fresh) readBtn.classList.remove("btn-attn");
+    else readBtn.classList.add("btn-attn");
+    setButtonEnabled(readBtn, hasFile && !busy);
+  }
+
+  setStepBadge_($("step2Badge"), 2, fresh);
+
+  // --- step 3: totals + send
+  const totalsBlock = $("totalsBlock");
+  const totalsEmpty = $("totalsEmpty");
+  const badge = $("modeBanner");
+  const modeNote = $("modeNote");
+
+  if (onReadTab) {
+    const t = computeTotals_();
+    $("grossTotalValue").textContent = formatWeight_(t.gross);
+    $("tareTotalValue").textContent = formatWeight_(t.tare);
+    $("netWeightTotalValue").textContent = formatWeight_(t.net);
+    $("netTotalValue").textContent = formatMoney_(t.cost);
+
+    const note = $("linesNote");
+    if (note) {
+      note.textContent = "";
+      const head = document.createElement("span");
+      head.textContent = t.lines === 0
+        ? "No line items found in rows 18 to 37."
+        : `${t.valid} of ${t.lines} line${t.lines === 1 ? "" : "s"} valid.`;
+      note.appendChild(head);
+
+      t.skipped.slice(0, 3).forEach(s => {
+        const el = document.createElement("span");
+        el.className = "skipped";
+        el.textContent = `Row ${s.row} not counted: ${s.reason}.`;
+        note.appendChild(el);
+      });
+      if (t.skipped.length > 3) {
+        const more = document.createElement("span");
+        more.className = "skipped";
+        more.textContent = `+${t.skipped.length - 3} more not counted.`;
+        note.appendChild(more);
+      }
+    }
+
+    if (badge) {
+      if (fileSame && receiverRecordExists === true) {
+        badge.className = "mode-badge modify";
+        badge.textContent = "UPDATE";
+      } else if (fileSame && receiverRecordExists === false) {
+        badge.className = "mode-badge create";
+        badge.textContent = "NEW";
+      } else {
+        badge.className = "mode-badge hidden";
+        badge.textContent = "";
+      }
+    }
+    if (modeNote) {
+      if (fileSame && receiverRecordExists === true) {
+        modeNote.textContent = "Already in Receiver Records. Sending updates it.";
+      } else if (fileSame && receiverRecordExists === false) {
+        modeNote.textContent = "Not in Receiver Records yet. Sending adds it.";
+      } else {
+        modeNote.textContent = "";
+      }
+    }
+
+    show(totalsBlock);
+    hide(totalsEmpty);
+    if (fresh) totalsBlock.classList.remove("is-stale");
+    else totalsBlock.classList.add("is-stale");
+  } else {
+    hide(totalsBlock);
+    show(totalsEmpty);
+    if (badge) {
+      badge.className = "mode-badge hidden";
+      badge.textContent = "";
+    }
+  }
+
+  const blocker = getSendBlocker_();
+  const blockerEl = $("sendBlocker");
+  if (blockerEl) {
+    if (blocker && hasFile) {
+      blockerEl.textContent = blocker;
+      show(blockerEl);
+    } else {
+      blockerEl.textContent = "";
+      hide(blockerEl);
+    }
+  }
+
+  const canSend = lastAuthOk && !blocker && !busy;
+  setButtonEnabled($("create_send"), canSend);
+  setStepBadge_($("step3Badge"), 3, false);
+
+  const sendPanel = $("createPanel");
+  if (sendPanel) {
+    if (canSend) sendPanel.classList.add("is-active");
+    else sendPanel.classList.remove("is-active");
+  }
+}
+
+// Kept for compatibility with older call sites.
+function refreshSendButtonsState() {
+  refreshUI();
 }
